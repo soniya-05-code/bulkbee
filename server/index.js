@@ -4,6 +4,7 @@ const multer = require("multer");
 const { parse } = require("csv-parse/sync");
 require("dotenv").config();
 const db = require("./db");
+const { startWorker } = require("./worker");
 
 const app = express();
 app.use(cors());
@@ -12,7 +13,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 app.get("/", (req, res) => res.send("BulkBee server running"));
 
-// List customers (optional ?search= and ?tag=)
+// ---------- Customers ----------
 app.get("/api/customers", (req, res) => {
   const { search = "", tag = "" } = req.query;
   const q = `%${search}%`;
@@ -26,7 +27,6 @@ app.get("/api/customers", (req, res) => {
   res.json(rows);
 });
 
-// Upload CSV (columns: name, email, tag)
 app.post("/api/customers/upload", upload.single("file"), (req, res) => {
   if (!req.file) return res.status(400).json({ error: "CSV file required" });
 
@@ -46,14 +46,19 @@ app.post("/api/customers/upload", upload.single("file"), (req, res) => {
     "INSERT OR IGNORE INTO customers (name, email, tag) VALUES (?, ?, ?)"
   );
   const emailOk = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
-  let added = 0, skipped = 0, invalid = 0;
+  let added = 0,
+    skipped = 0,
+    invalid = 0;
 
   db.transaction((rows) => {
     for (const r of rows) {
       const name = (r.name || "").trim();
       const email = (r.email || "").trim().toLowerCase();
       const tag = (r.tag || "Regular").trim();
-      if (!name || !emailOk(email)) { invalid++; continue; }
+      if (!name || !emailOk(email)) {
+        invalid++;
+        continue;
+      }
       insert.run(name, email, tag).changes ? added++ : skipped++;
     }
   })(records);
@@ -61,4 +66,48 @@ app.post("/api/customers/upload", upload.single("file"), (req, res) => {
   res.json({ total: records.length, added, skipped, invalid });
 });
 
+// ---------- Campaigns ----------
+app.post("/api/campaigns", (req, res) => {
+  const { name, subject, message, tag = "" } = req.body;
+  if (!name || !subject || !message)
+    return res
+      .status(400)
+      .json({ error: "name, subject and message are required" });
+
+  const customers = db
+    .prepare("SELECT id FROM customers WHERE (? = '' OR tag = ?)")
+    .all(tag, tag);
+  if (!customers.length)
+    return res.status(400).json({ error: "No customers match this segment" });
+
+  const info = db
+    .prepare(
+      "INSERT INTO campaigns (name, subject, message, tag) VALUES (?, ?, ?, ?)"
+    )
+    .run(name, subject, message, tag);
+  const ins = db.prepare(
+    "INSERT INTO email_logs (campaign_id, customer_id) VALUES (?, ?)"
+  );
+  db.transaction(() => {
+    for (const c of customers) ins.run(info.lastInsertRowid, c.id);
+  })();
+
+  res.json({ id: info.lastInsertRowid, queued: customers.length });
+});
+
+app.get("/api/campaigns", (req, res) => {
+  const rows = db
+    .prepare(
+      `SELECT c.*,
+         COALESCE(SUM(l.status='sent'),0) AS sent,
+         COALESCE(SUM(l.status='failed'),0) AS failed,
+         COALESCE(SUM(l.status='pending'),0) AS pending
+       FROM campaigns c LEFT JOIN email_logs l ON l.campaign_id = c.id
+       GROUP BY c.id ORDER BY c.id DESC`
+    )
+    .all();
+  res.json(rows);
+});
+
 app.listen(5000, () => console.log("Server on port 5000"));
+startWorker();
